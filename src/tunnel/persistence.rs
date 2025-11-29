@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 
-pub async fn get_or_create_secret_key() -> Result<SecretKey> {
+pub async fn get_or_create_secret_key(persist: bool) -> Result<SecretKey> {
     let path = std::path::Path::new(".tunnel_key");
-    if path.exists() {
+
+    if persist && path.exists() {
         let bytes = tokio::fs::read(path)
             .await
             .context("Failed to read .tunnel_key")?;
@@ -15,10 +16,16 @@ pub async fn get_or_create_secret_key() -> Result<SecretKey> {
         Ok(key)
     } else {
         let key = SecretKey::generate(&mut rand::rng());
-        tokio::fs::write(path, key.to_bytes())
-            .await
-            .context("Failed to write .tunnel_key")?;
-        println!("🔑 Generated and saved new secret key");
+
+        if persist {
+            tokio::fs::write(path, key.to_bytes())
+                .await
+                .context("Failed to write .tunnel_key")?;
+            println!("🔑 Generated and saved new secret key");
+        } else {
+            println!("🔑 Generated ephemeral secret key (not persisted)");
+        }
+
         Ok(key)
     }
 }
@@ -47,4 +54,15 @@ pub async fn load_remote_peer_id() -> Option<iroh::PublicKey> {
         }
     }
     None
+}
+
+pub async fn clear_remote_peer_id() -> Result<()> {
+    let path = std::path::Path::new(".tunnel_peer");
+    if path.exists() {
+        tokio::fs::remove_file(path)
+            .await
+            .context("Failed to remove .tunnel_peer")?;
+        println!("🗑️  Cleared persisted peer ID");
+    }
+    Ok(())
 }

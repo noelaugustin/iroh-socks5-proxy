@@ -9,7 +9,7 @@ use iroh_socks5_proxy::tunnel::connection::{
     generate_ticket, handle_peer_connection_with_monitoring, monitor_connection_health,
 };
 use iroh_socks5_proxy::tunnel::persistence::{
-    get_or_create_secret_key, load_remote_peer_id, save_remote_peer_id,
+    clear_remote_peer_id, get_or_create_secret_key, save_remote_peer_id,
 };
 use iroh_socks5_proxy::tunnel::socks::handle_socks_client;
 use iroh_socks5_proxy::tunnel::state::{ConnectionState, TUNNEL_ALPN, TunnelState};
@@ -36,7 +36,12 @@ async fn main() -> Result<()> {
 
     println!("🚇 Starting Iroh Tunnel...");
 
-    let secret_key = get_or_create_secret_key().await?;
+    // Determine if we should persist the secret key:
+    // - Server mode (no -c flag): persist key for stable Node ID
+    // - Client mode (with -c flag): ephemeral key for random Node ID each run
+    let persist_key = args.peer.is_none();
+
+    let secret_key = get_or_create_secret_key(persist_key).await?;
 
     // Setup Iroh Endpoint
     let endpoint = Endpoint::builder()
@@ -50,29 +55,38 @@ async fn main() -> Result<()> {
     println!("🔗 Endpoints: (waiting for discovery...)");
     println!();
 
-    // Load persisted peer ID if exists (for reconnection after restart)
-    let persisted_peer_id = load_remote_peer_id().await;
+    // Determine which peer to connect to based on command line args
+    let peer_to_connect = if let Some(peer_ticket) = &args.peer {
+        // Client mode: explicit peer provided via -c flag
+        // Clear any old persisted peer to ensure fresh connection
+        clear_remote_peer_id().await.ok();
+
+        let peer_id: iroh::PublicKey =
+            peer_ticket.parse().context("Failed to parse peer ticket")?;
+
+        Some(peer_id)
+    } else {
+        // Server mode: don't load persisted peer, just wait for incoming connections
+        // Clear any stale .tunnel_peer file to avoid confusion
+        clear_remote_peer_id().await.ok();
+        None
+    };
 
     let state = Arc::new(Mutex::new(TunnelState {
         peer_connection: None,
         connection_state: ConnectionState::Disconnected,
-        remote_peer_id: persisted_peer_id, // Load from disk!
+        remote_peer_id: peer_to_connect,
         reconnect_attempts: 0,
         last_connection_attempt: None,
         _log_file: args.log_file.clone(),
     }));
 
-    // If peer is provided, connect to it (client mode)
-    if let Some(peer_ticket) = args.peer {
-        let peer_id: iroh::PublicKey =
-            peer_ticket.parse().context("Failed to parse peer ticket")?;
-
-        // Store peer ID for reconnection (in memory and on disk)
-        {
-            let mut state_guard = state.lock().await;
-            state_guard.remote_peer_id = Some(peer_id);
+    // If we have a peer to connect to (either from -c flag or persisted), connect to it (client mode)
+    if let Some(peer_id) = peer_to_connect {
+        // Persist to disk (only if explicitly provided via -c flag)
+        if args.peer.is_some() {
+            save_remote_peer_id(peer_id).await.ok();
         }
-        save_remote_peer_id(peer_id).await.ok(); // Persist to disk
 
         println!("🔌 Connecting to peer...");
         match endpoint.connect(peer_id, TUNNEL_ALPN).await {
@@ -145,14 +159,15 @@ async fn main() -> Result<()> {
                                 let remote_id = connection.remote_id();
                                 println!("✅ Peer connected: {}", remote_id);
 
-                                // Store remote peer ID for bidirectional reconnection (in memory and on disk)
+                                // Store remote peer ID in memory only (server doesn't persist)
                                 {
                                     let mut state_guard = state_clone_inner.lock().await;
                                     state_guard.peer_connection = Some(connection.clone());
                                     state_guard.remote_peer_id = Some(remote_id);
                                     state_guard.connection_state = ConnectionState::Connected;
                                 }
-                                save_remote_peer_id(remote_id).await.ok(); // Persist to disk
+                                // Note: Server mode does NOT persist peer ID to disk
+                                // This allows accepting connections from any peer
 
                                 // Spawn handler with monitoring
                                 handle_peer_connection_with_monitoring(
